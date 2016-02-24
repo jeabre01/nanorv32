@@ -206,6 +206,7 @@ module nanorv32 (/*AUTOARG*/
    wire                                     stall_exe;
    wire                                     stall_fetch;
    reg                                      force_stall_pstate;
+   reg                                      force_stall_pstate2;
 
 
    reg                                      output_new_pc;
@@ -977,7 +978,7 @@ module nanorv32 (/*AUTOARG*/
    always @* begin
       case(regfile_write_sel)
         NANORV32_MUX_SEL_REGFILE_WRITE_YES: begin
-           write_rd = (!stall_exe) & valid_inst;
+           write_rd = (!stall_exe) & valid_inst & ~(datamem_read);
         end
         NANORV32_MUX_SEL_REGFILE_WRITE_NO: begin
            write_rd = 1'b0;
@@ -989,6 +990,28 @@ module nanorv32 (/*AUTOARG*/
       endcase // case (regfile_write)
 
    end
+   `define PIPELINE_DSIDE
+   `ifdef PIPELINE_DSIDE
+   reg [NANORV32_INST_FORMAT_RD_MSB:0] dec_rd2; 
+   reg write_rd2;
+   always @(posedge clk or negedge rst_n) begin
+      if(rst_n == 1'b0) begin
+         /*AUTORESET*/
+         // Beginning of autoreset for uninitialized flops
+         write_rd2 <= 1'b0;
+         dec_rd2   <= {NANORV32_INST_FORMAT_RD_SIZE{1'b0}}; 
+         // End of automatics
+      end
+      else begin
+         if ((datamem_write || datamem_read) & ~force_stall_pstate2)
+           begin
+           write_rd2 <= write_rd;
+           dec_rd2   <= dec_rd; 
+           end
+      end
+   end
+   wire [31:0]  rd2 = mem2regfile;
+   `endif
 
    //===========================================================================
    // Data memory interface
@@ -1107,6 +1130,7 @@ module nanorv32 (/*AUTOARG*/
 
         NANORV32_PSTATE_RESET: begin
            force_stall_pstate = 1;
+           force_stall_pstate2 = 1;
            force_stall_reset = 1;
            pstate_next =  NANORV32_PSTATE_CONT;
 
@@ -1114,6 +1138,7 @@ module nanorv32 (/*AUTOARG*/
         NANORV32_PSTATE_CONT: begin
            if(branch_taken) begin
               force_stall_pstate = 1;
+              force_stall_pstate2 = 0;
               pstate_next =  NANORV32_PSTATE_BRANCH;
               output_new_pc = 1;
            end
@@ -1121,7 +1146,8 @@ module nanorv32 (/*AUTOARG*/
              begin
                 // we use an early "ready",
                 // so we move to state WAITLD when the memory is ready
-                force_stall_pstate = 1;
+                force_stall_pstate = 0;
+                force_stall_pstate2 = 1;
                 data_access_cycle  = 1; 
                 pstate_next = NANORV32_PSTATE_WAITLD;
              end
@@ -1131,10 +1157,12 @@ module nanorv32 (/*AUTOARG*/
            output_new_pc = 1;
           if (codeif_cpu_ready_r) begin
               force_stall_pstate = 1'b0;
+              force_stall_pstate2 = 0;
               pstate_next =  NANORV32_PSTATE_CONT;
            end
            else begin
               force_stall_pstate = 1'b1;
+              force_stall_pstate2 = 0;
               pstate_next =  NANORV32_PSTATE_BRANCH;
            end
         end
@@ -1143,10 +1171,12 @@ module nanorv32 (/*AUTOARG*/
            if (codeif_cpu_ready_r)
              begin
               force_stall_pstate = 1'b0;
+              force_stall_pstate2 = 0;
               pstate_next =  NANORV32_PSTATE_CONT ;
            end
            else begin
               force_stall_pstate = 1'b1;
+              force_stall_pstate2 = 0;
               pstate_next =  NANORV32_PSTATE_STALL;
            end
         end // case: NANORV32_PSTATE_STALL
@@ -1158,14 +1188,26 @@ module nanorv32 (/*AUTOARG*/
            //  end
            //else begin
               data_started        = 1; 
-              data_access_cycle  = 0; 
               if(hreadyd) begin
-                pstate_next =  NANORV32_PSTATE_CONT;
-                force_stall_pstate = 1'b0;
+                 if((datamem_write || datamem_read))
+                 begin
+                  // we use an early "ready",
+                  // so we move to state WAITLD when the memory is ready
+                  force_stall_pstate = 0;
+                  force_stall_pstate2 = 1;
+                  data_access_cycle  = 1; 
+                  pstate_next = NANORV32_PSTATE_WAITLD;
+                end else begin 
+                  pstate_next =  NANORV32_PSTATE_CONT;
+                  force_stall_pstate = 1'b0;
+                  force_stall_pstate2 = 0;
+                  data_access_cycle  = 0; 
+                end
               end
               else begin
                  pstate_next =  NANORV32_PSTATE_WAITLD;
                  force_stall_pstate = 1'b1;
+                 force_stall_pstate2 = 1;
               end
            // end
         end // case: NANORV32_PSTATE_WAITLD
@@ -1173,6 +1215,7 @@ module nanorv32 (/*AUTOARG*/
 
            pstate_next =  NANORV32_PSTATE_CONT;
            force_stall_pstate = 0;
+           force_stall_pstate2 = 0;
            force_stall_reset = 0;
            output_new_pc = 0;
         end
@@ -1200,8 +1243,11 @@ module nanorv32 (/*AUTOARG*/
                .sel_porta               (dec_rs1[NANORV32_RF_PORTA_MSB:0]),
                .sel_portb               (dec_rs2[NANORV32_RF_PORTB_MSB:0]),
                .sel_rd                  (dec_rd[NANORV32_RF_PORTRD_MSB:0]),
+               .sel_rd2                 (dec_rd2[NANORV32_RF_PORTRD_MSB:0]),
                .rd                      (rd[NANORV32_DATA_MSB:0]),
+               .rd2                     (rd2[NANORV32_DATA_MSB:0]),
                .write_rd                (write_rd),
+               .write_rd2               (write_rd2),
                .clk                     (clk),
                .rst_n                   (rst_n));
 
